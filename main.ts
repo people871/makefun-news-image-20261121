@@ -1,103 +1,144 @@
-// news-image-20261121 — entry program (Node 22, standard library only).
+// Saturday 21 November 2026 — one-image newspaper front page (v3).
 //
-// The entry is a single JPEG newspaper front page for Saturday 21 November
-// 2026, stored beside this file as entry.png. This program does not draw or
-// fetch anything: it loads the bundled bytes, proves they are a complete
-// 1024x1024 JPEG, and only then copies the exact bytes to the output path.
-// After writing it reads the file back and refuses to exit cleanly unless
-// the copy matches the source byte for byte (length and SHA-256).
+// The front page is typeset programmatically (render_v3.py) from an
+// explicit story list, so every headline and caption is measured before
+// it is drawn and nothing can be silently clipped. This program does not
+// draw, generate, or alter the picture: it ships the stored bytes
+// (entry.png, a JPEG file kept next to this script) to the directory the
+// harness asks for, but only after proving the file on disk is exactly
+// the v3 front page — byte count and SHA-256 are pinned below, so a stale
+// or swapped image is refused instead of shipped. After the copy it reads
+// the destination back and compares it with the source, so a silent short
+// write or a corrupted disk cannot slip through unnoticed.
 //
-// Usage:  mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
+// Run it locally with:
+//   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
+//
+// Node 22, standard library only. No dependencies, no network.
 
 import { createHash } from "node:crypto";
-import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const EXPECTED_WIDTH = 1024;
-const EXPECTED_HEIGHT = 1024;
-const MAX_BYTES = 1_048_576;
+// The v3 front page, produced by render_v3.py: 37 sourced stories,
+// a 23-pin world map, a UTC timeline and a date check.
+const EXPECTED = {
+  bytes: 266300,
+  sha256: "d2b918b09691b17bc520844e0d6c6da925c901e1ce0e5355a5b5e2338f0540f3",
+  width: 1024,
+  height: 1024,
+  maxBytes: 1024 * 1024,
+};
 
-function fail(message) {
-  console.error(`entry: ${message}`);
-  process.exit(1);
+// Markers that carry no payload length (standalone markers).
+const STANDALONE = new Set([0x01, 0xd8, 0xd9, ...[0, 1, 2, 3, 4, 5, 6, 7].map((i) => 0xd0 + i)]);
+// Start-of-frame markers that describe the pixel grid.
+const FRAME = new Set([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf]);
+
+function fail(reason) {
+  console.error(`front-page v3: refusing to ship — ${reason}`);
+  process.exitCode = 1;
+  throw new Error(reason);
 }
 
-function sha256Hex(bytes) {
-  return createHash("sha256").update(bytes).digest("hex");
+function sha256Hex(data) {
+  return createHash("sha256").update(data).digest("hex");
 }
 
-// Walk the JPEG marker segments from the start of the buffer and return the
-// width/height carried by the first Start-Of-Frame marker (SOF0/SOF1/SOF2).
-// Returns null when no frame header is found before the scan data begins.
-function frameSize(jpeg) {
-  let cursor = 2; // skip the SOI marker (FFD8)
-  while (cursor + 9 <= jpeg.length) {
-    if (jpeg[cursor] !== 0xff) return null;
-    const marker = jpeg[cursor + 1];
-    if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) {
-      cursor += 2;
+// One pass over the JPEG stream. Confirms the SOI/EOI envelope, walks
+// every marker segment until the scan data (SOS), and pulls the pixel
+// grid out of the first frame segment it meets. Returns everything the
+// caller needs in a single plain object.
+function scan(jpeg) {
+  if (jpeg.length < 8) fail(`file is only ${jpeg.length} bytes`);
+  if (jpeg[0] !== 0xff || jpeg[1] !== 0xd8) fail("missing SOI marker FFD8 at the start");
+  if (jpeg[jpeg.length - 2] !== 0xff || jpeg[jpeg.length - 1] !== 0xd9) {
+    fail("missing EOI marker FFD9 at the end");
+  }
+  if (jpeg.length > EXPECTED.maxBytes) {
+    fail(`file is ${jpeg.length} bytes, over the ${EXPECTED.maxBytes} byte limit`);
+  }
+
+  const found = { segments: 0, dqt: false, dht: false, width: 0, height: 0, components: 0, sosAt: -1 };
+  let pos = 2; // FFD8 already confirmed
+  while (pos + 1 < jpeg.length) {
+    if (jpeg[pos] !== 0xff) {
+      fail(`byte ${pos} is 0x${jpeg[pos].toString(16)} where a marker prefix 0xff was expected`);
+    }
+    const marker = jpeg[pos + 1];
+    found.segments += 1;
+    if (marker === 0xda) {
+      found.sosAt = pos;
+      break; // scan data follows; nothing more to parse
+    }
+    if (marker === 0xdb) found.dqt = true;
+    if (marker === 0xc4) found.dht = true;
+    if (STANDALONE.has(marker)) {
+      pos += 2;
       continue;
     }
-    if (marker === 0xda) return null; // SOS: scan data follows, no SOF seen
-    const segmentLength = jpeg.readUInt16BE(cursor + 2);
-    if (segmentLength < 2 || cursor + 2 + segmentLength > jpeg.length) return null;
-    const isFrame = marker === 0xc0 || marker === 0xc1 || marker === 0xc2;
-    if (isFrame) {
-      // Layout of a frame segment: length(2) precision(1) height(2) width(2)
-      // components(1) then 3 bytes per component. A real baseline frame has
-      // 1-4 components and an 8-bit sample precision.
-      const precision = jpeg[cursor + 4];
-      const components = jpeg[cursor + 9];
-      if (precision !== 8) return null;
-      if (components < 1 || components > 4) return null;
-      if (segmentLength < 8 + 3 * components) return null;
-      const height = jpeg.readUInt16BE(cursor + 5);
-      const width = jpeg.readUInt16BE(cursor + 7);
-      return { width, height };
+    if (pos + 4 > jpeg.length) fail(`segment starting at ${pos} is cut off`);
+    const declared = jpeg.readUInt16BE(pos + 2);
+    if (declared < 2) fail(`segment at ${pos} declares an impossible length ${declared}`);
+    if (pos + 2 + declared > jpeg.length) fail(`segment at ${pos} overruns the file`);
+    if (FRAME.has(marker)) {
+      if (declared - 2 < 6) fail("frame segment is too short to hold dimensions");
+      const precision = jpeg[pos + 4];
+      found.height = jpeg.readUInt16BE(pos + 5);
+      found.width = jpeg.readUInt16BE(pos + 7);
+      found.components = jpeg[pos + 9];
+      if (precision !== 8) fail(`sample precision is ${precision}, expected 8`);
+      if (found.components < 1 || found.components > 4) {
+        fail(`component count ${found.components} is outside 1..4`);
+      }
     }
-    cursor += 2 + segmentLength;
+    pos += 2 + declared;
   }
-  return null;
-}
-
-function checkJpeg(bytes) {
-  if (bytes.length < 4) fail("image is too short to be a JPEG");
-  if (bytes[0] !== 0xff || bytes[1] !== 0xd8) fail("image does not start with the JPEG SOI marker");
-  if (bytes[bytes.length - 2] !== 0xff || bytes[bytes.length - 1] !== 0xd9) {
-    fail("image does not end with the JPEG EOI marker");
+  if (found.sosAt < 0) fail("ran out of bytes before the start-of-scan marker");
+  if (found.width === 0) fail("no frame segment found before the scan data");
+  if (!found.dqt) fail("required quantisation tables (DQT) are absent");
+  if (!found.dht) fail("required Huffman tables (DHT) are absent");
+  if (found.width !== EXPECTED.width || found.height !== EXPECTED.height) {
+    fail(`picture is ${found.width}x${found.height}, expected ${EXPECTED.width}x${EXPECTED.height}`);
   }
-  if (bytes.length > MAX_BYTES) fail(`image is ${bytes.length} bytes, over the 1 MiB limit`);
-  const size = frameSize(bytes);
-  if (size === null) fail("no JPEG frame header found before the scan data");
-  if (size.width !== EXPECTED_WIDTH || size.height !== EXPECTED_HEIGHT) {
-    fail(`image is ${size.width}x${size.height}, expected ${EXPECTED_WIDTH}x${EXPECTED_HEIGHT}`);
-  }
+  return found;
 }
 
 async function main() {
-  const here = dirname(fileURLToPath(import.meta.url));
-  const sourcePath = resolve(here, "entry.png");
+  const scriptDir = dirname(fileURLToPath(import.meta.url));
+  const sourcePath = resolve(scriptDir, "entry.png");
   const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? "/output";
   const targetPath = resolve(outDir, "entry.png");
 
-  const bytes = await readFile(sourcePath);
-  checkJpeg(bytes);
-  const sourceDigest = sha256Hex(bytes);
-  const size = frameSize(bytes);
+  const original = await readFile(sourcePath);
+  if (original.length !== EXPECTED.bytes) {
+    fail(`source is ${original.length} bytes, expected the v3 front page at ${EXPECTED.bytes} bytes`);
+  }
+  const sourceDigest = sha256Hex(original);
+  if (sourceDigest !== EXPECTED.sha256) {
+    fail(`source sha256 ${sourceDigest} does not match the v3 front page ${EXPECTED.sha256}`);
+  }
+  const info = scan(original);
 
   await mkdir(outDir, { recursive: true });
-  await writeFile(targetPath, bytes);
+  await writeFile(targetPath, original);
 
-  const written = await readFile(targetPath);
-  if (written.length !== bytes.length) {
-    fail(`written file is ${written.length} bytes, source is ${bytes.length}`);
+  const shipped = await readFile(targetPath);
+  if (!shipped.equals(original)) {
+    fail(`copy differs from source (shipped ${shipped.length} bytes, source ${original.length} bytes)`);
   }
-  const writtenDigest = sha256Hex(written);
-  if (writtenDigest !== sourceDigest) {
-    fail(`written file sha256 ${writtenDigest} does not match source ${sourceDigest}`);
-  }
-  console.log(`entry: wrote ${targetPath} (${written.length} bytes, ${size.width}x${size.height} JPEG, sha256 ${writtenDigest})`);
+  if (sha256Hex(shipped) !== EXPECTED.sha256) fail("copy digest does not match the v3 front page");
+
+  console.log(
+    `front-page v3: shipped ${targetPath} — ${shipped.length} bytes, ` +
+      `${info.width}x${info.height} JPEG (${info.components} components, ${info.segments} segments), sha256 ${EXPECTED.sha256}`,
+  );
 }
 
-main().catch((error) => fail(error.message ?? String(error)));
+main().catch((error) => {
+  if (process.exitCode !== 1) {
+    console.error(`front-page v3: unexpected failure — ${error.message ?? String(error)}`);
+    process.exitCode = 1;
+  }
+});
